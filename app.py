@@ -36,6 +36,9 @@ MODEL_OPTIONS = [
     "gemini-2.5-flash-lite",   # 더 빠르고 한도 넉넉 (무료)
 ]
 
+# 식품 카테고리 (선택용)
+CATEGORIES = ["유제품", "가공식품", "신선식품", "냉동식품", "채소", "과일", "정육", "수산", "음료", "기타"]
+
 st.set_page_config(
     page_title="스마트 냉장고",
     page_icon="🧊",
@@ -293,6 +296,42 @@ def call_gemini_pair(api_key, model, prod, exp, purchase_day):
     return extract_json_object(resp.text or "")
 
 
+def receipt_user_prompt() -> str:
+    return """이 이미지는 마트/편의점 영수증이다.
+
+규칙:
+1. 영수증에서 '식재료 및 식품' 품목만 골라서 추출해라.
+2. 다음은 반드시 제외해라: 봉투값/쇼핑백, 할인·에누리, 적립/포인트, 결제수단·카드정보, 합계·부가세,
+   그리고 식품이 아닌 물건(세제, 휴지, 주방용품, 위생용품, 문구 등).
+3. 각 품목의 category 를 다음 중 하나로 지정해라:
+   '유제품','가공식품','신선식품','냉동식품','채소','과일','정육','수산','음료','기타'.
+4. 유통기한은 넣지 마라. (유통기한은 사용자가 직접 입력한다)
+5. 품목명이 영수증에 축약돼 있으면 알아보기 쉬운 이름으로 살짝 정리해도 된다.
+
+반드시 아래 JSON 배열만 반환하고, 다른 설명이나 마크다운(```json 등)은 절대 붙이지 마라.
+식재료가 하나도 없으면 빈 배열 [] 을 반환해라.
+
+[{"item_name": "서울우유 1L", "category": "유제품"}, {"item_name": "국산콩 두부", "category": "가공식품"}]"""
+
+
+def call_gemini_receipt(api_key, model, media_type, image_bytes):
+    """영수증 이미지 하나에서 식재료 목록(JSON 배열)을 추출. 각 원소 = {item_name, category}"""
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=media_type),
+            receipt_user_prompt(),
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=("너는 영수증에서 식재료·식품만 골라내는 전문 AI다. "
+                                "요청한 JSON 배열만 출력한다."),
+            response_mime_type="application/json",
+        ),
+    )
+    return extract_json_array(resp.text or "")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 접속 비밀번호 잠금 (Secrets의 APP_PASSWORD 사용, 미설정 시 잠금 해제)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,7 +410,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_inv, tab_scan = st.tabs(["📊 내 냉장고", "📸 제품+유통기한 스캔"])
+tab_inv, tab_scan = st.tabs(["📊 내 냉장고", "🧾 영수증 스캔"])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 탭 1: 인벤토리
@@ -405,6 +444,21 @@ with tab_inv:
         )
 
     st.write("")
+
+    # ➕ 직접 추가 (영수증에 없어도 수동 등록)
+    with st.expander("➕ 직접 추가하기"):
+        ac = st.columns([2, 1])
+        add_name = ac[0].text_input("품목명", key="add_name", placeholder="예: 계란 한판")
+        add_cat = ac[1].selectbox("카테고리", CATEGORIES, key="add_cat")
+        add_exp = st.date_input("유통기한", value=date.today() + timedelta(days=7),
+                                key="add_exp", format="YYYY-MM-DD")
+        if st.button("추가", type="primary", key="add_btn"):
+            if add_name.strip():
+                add_item(add_name.strip(), add_cat, date.today().isoformat(), add_exp.isoformat())
+                st.success(f"'{add_name.strip()}'을(를) 추가했어요!")
+                st.rerun()
+            else:
+                st.warning("품목명을 입력해 주세요.")
 
     if not items:
         st.info("아직 등록된 식재료가 없어요. '영수증 스캔' 탭에서 영수증을 올려보세요! 🧾")
@@ -460,132 +514,93 @@ with tab_inv:
 # 탭 2: 영수증 스캔
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_scan:
-    st.markdown("#### 📸 제품 + 유통기한 사진 스캔")
-    st.caption("촬영한 순서대로 '제품 → 유통기한'을 반복해서 찍은 뒤 한꺼번에 올리세요. "
-               "예: 스윙칩 · 스윙칩 유통기한 · 우유 · 우유 유통기한 … "
-               "앱이 2장씩 자동으로 한 세트로 묶습니다.")
+    st.markdown("#### 🧾 영수증 스캔")
+    st.caption("영수증 사진을 올리면 식재료·식품만 자동으로 골라내 목록을 만들어요. "
+               "유통기한은 저장 전에 달력에서 직접 선택하면 됩니다.")
 
-    files = st.file_uploader(
-        "사진 여러 장 선택 (2장 = 한 제품)",
+    uploaded = st.file_uploader(
+        "마트/편의점 영수증 사진을 올려주세요",
         type=["jpg", "jpeg", "png", "webp", "gif"],
-        accept_multiple_files=True,
     )
 
-    cold1, cold2 = st.columns([1, 1])
-    purchase_day = cold1.date_input("구매일", value=date.today(), format="YYYY-MM-DD")
+    purchase_day = st.date_input("구매일", value=date.today(), format="YYYY-MM-DD")
 
-    st.caption("💡 키/가입 없이 먼저 화면만 체험하려면 아래 '데모로 체험하기'를 누르세요.")
+    st.caption("💡 키/가입 없이 화면만 체험하려면 아래 '데모로 체험하기'를 누르세요.")
 
-    # 데모(샘플) — API 키·사진 없이 무료로 앱 전체 기능 체험
+    # 데모(샘플) — API 키·사진 없이 무료로 앱 전체 기능 체험 (식재료 목록만)
     if st.button("🧪 데모로 체험하기 (무료·키 불필요)", use_container_width=True):
-        p = purchase_day.isoformat()
-        def _plus(n):
-            return (purchase_day + timedelta(days=n)).isoformat()
         st.session_state["scanned"] = [
-            {"item_name": "농심 스윙칩 오리지널", "purchase_date": p, "expiration_date": _plus(120), "category": "가공식품"},
-            {"item_name": "서울우유 1L", "purchase_date": p, "expiration_date": _plus(10), "category": "유제품"},
-            {"item_name": "국산콩 두부", "purchase_date": p, "expiration_date": _plus(14), "category": "가공식품"},
-            {"item_name": "삼겹살 500g", "purchase_date": p, "expiration_date": _plus(3), "category": "정육"},
+            {"item_name": "서울우유 1L", "category": "유제품"},
+            {"item_name": "국산콩 두부", "category": "가공식품"},
+            {"item_name": "대파 한단", "category": "채소"},
+            {"item_name": "삼겹살 500g", "category": "정육"},
+            {"item_name": "냉동만두", "category": "냉동식품"},
         ]
-        st.success("데모 샘플을 불러왔어요! 아래에서 저장 후 '내 냉장고' 탭을 확인해보세요.")
+        st.success("데모 식재료 목록을 불러왔어요! 아래에서 유통기한을 정하고 저장해보세요.")
 
-    if files:
-        # 촬영 순서를 살리기 위해 파일명(보통 촬영시각) 기준 정렬 후 2장씩 페어링
-        ordered = sorted(files, key=lambda f: f.name)
-        pairs = [(ordered[i], ordered[i + 1]) for i in range(0, len(ordered) - 1, 2)]
-        leftover = ordered[-1] if len(ordered) % 2 == 1 else None
+    if uploaded is not None:
+        media_type, img_bytes, preview = prepare_image(uploaded)
+        st.image(preview, caption="업로드한 영수증", use_container_width=True)
 
-        st.markdown(f"**{len(pairs)}개 세트로 묶었어요** · 사진 {len(ordered)}장")
-        for idx, (prod_f, exp_f) in enumerate(pairs, 1):
-            with st.container(border=True):
-                st.caption(f"세트 {idx}")
-                pc = st.columns(2)
-                pc[0].image(prod_f, caption="제품", use_container_width=True)
-                pc[1].image(exp_f, caption="유통기한", use_container_width=True)
-        if leftover is not None:
-            st.warning("⚠️ 마지막 사진 1장이 짝이 없어요. '제품 → 유통기한' 순서로 짝수 장이 되게 올려주세요. "
-                       "(이 사진은 분석에서 제외됩니다.)")
-
-        if st.button("🔍 세트별로 분석하기 (실제 AI)", type="primary", use_container_width=True):
+        if st.button("🔍 영수증에서 식재료 자동 추출", type="primary", use_container_width=True):
             if not api_key:
-                st.info("실제 사진 인식은 Gemini API 키가 필요해요(무료·카드 불필요). "
+                st.info("실제 영수증 인식은 Gemini API 키가 필요해요(무료·카드 불필요). "
                         "화면만 볼 거면 위 '데모로 체험하기'를 이용하세요.")
-            elif not pairs:
-                st.warning("최소 2장(제품 1장 + 유통기한 1장)을 올려주세요.")
             else:
-                results = []
-                errors = 0
-                prog = st.progress(0.0, text="사진을 읽는 중...")
-                for idx, (prod_f, exp_f) in enumerate(pairs):
+                with st.spinner("영수증에서 식재료를 골라내는 중..."):
                     try:
-                        pm, pb, _ = prepare_image(prod_f)
-                        em, eb, _ = prepare_image(exp_f)
-                        obj = call_gemini_pair(api_key, model, (pm, pb), (em, eb),
-                                               purchase_day.isoformat())
-                        if isinstance(obj, dict):
-                            results.append(obj)
+                        result = call_gemini_receipt(api_key, model, media_type, img_bytes)
+                        if not isinstance(result, list):
+                            raise ValueError("응답이 목록 형식이 아닙니다.")
+                        if result:
+                            st.session_state["scanned"] = result
+                            st.success(f"식재료 {len(result)}개를 골라냈어요! 아래에서 확인·수정하고 유통기한을 정하세요.")
                         else:
-                            errors += 1
-                    except Exception:
-                        errors += 1
-                    prog.progress((idx + 1) / len(pairs), text=f"{idx + 1}/{len(pairs)} 세트 완료")
-                prog.empty()
-                if results:
-                    st.session_state["scanned"] = results
-                    msg = f"{len(results)}개 제품을 인식했어요! 아래에서 확인·수정 후 저장하세요."
-                    if errors:
-                        msg += f" (일부 {errors}개는 인식 실패)"
-                    st.success(msg)
-                else:
-                    st.error("인식된 제품이 없어요. 사진이 선명한지, 순서가 맞는지 확인해 주세요.")
+                            st.warning("영수증에서 식재료를 찾지 못했어요. 사진이 선명한지 확인하거나, 아래에서 직접 추가하세요.")
+                    except Exception as e:
+                        st.error(f"인식에 실패했어요. 사진이 선명한지 확인 후 다시 시도해 주세요. ({e})")
 
-    # 분석 결과 편집 & 저장
+    # 추출 결과 확인·수정·저장 (유통기한은 달력에서 직접 선택)
     if st.session_state.get("scanned"):
         st.divider()
-        st.markdown("#### 📝 추출 결과 확인 및 저장")
+        st.markdown("#### 📝 목록 확인 · 유통기한 선택")
+        st.caption("이름/카테고리를 고치거나, 필요 없는 건 '포함'을 꺼서 빼세요. 유통기한은 달력에서 선택합니다.")
         scanned = st.session_state["scanned"]
 
         edited = []
         for i, obj in enumerate(scanned):
-            name = str(obj.get("item_name", "이름없음"))
+            name = str(obj.get("item_name", ""))
             cat = str(obj.get("category", "기타"))
-            pdate = str(obj.get("purchase_date", purchase_day.isoformat()))
-            raw_exp = obj.get("expiration_date")
+            cat_idx = CATEGORIES.index(cat) if cat in CATEGORIES else CATEGORIES.index("기타")
             try:
-                exp_default = date.fromisoformat(str(raw_exp))
-                unreadable = False
+                exp_default = date.fromisoformat(str(obj.get("expiration_date")))
             except (ValueError, TypeError):
-                exp_default = date.today()
-                unreadable = True
+                exp_default = date.today() + timedelta(days=7)
 
             with st.container(border=True):
-                top = st.columns([3, 2])
-                top[0].markdown(f"**{html_lib.escape(name)}**  \n"
-                                f"<span class='cat-chip'>{html_lib.escape(cat)}</span> 구매 {html_lib.escape(pdate)}",
-                                unsafe_allow_html=True)
-                include = top[1].checkbox("포함", value=True, key=f"inc_{i}")
-                if unreadable:
-                    st.caption("⚠️ 유통기한을 못 읽었어요. 아래에서 직접 지정해 주세요.")
-                new_exp = st.date_input(
-                    "소비기한(수정 가능)", value=exp_default,
-                    key=f"scan_date_{i}", format="YYYY-MM-DD",
-                )
+                r1 = st.columns([3, 1])
+                new_name = r1[0].text_input("품목명", value=name, key=f"nm_{i}")
+                include = r1[1].checkbox("포함", value=True, key=f"inc_{i}")
+                r2 = st.columns([1, 1])
+                new_cat = r2[0].selectbox("카테고리", CATEGORIES, index=cat_idx, key=f"cat_{i}")
+                new_exp = r2[1].date_input("유통기한(달력에서 선택)", value=exp_default,
+                                           key=f"exp_{i}", format="YYYY-MM-DD")
             edited.append({
-                "include": include, "item_name": name, "category": cat,
-                "purchase_date": pdate, "expiration_date": new_exp.isoformat(),
+                "include": include, "item_name": new_name, "category": new_cat,
+                "purchase_date": purchase_day.isoformat(), "expiration_date": new_exp.isoformat(),
             })
 
         cbtn = st.columns([1, 1])
         if cbtn[0].button("🧊 냉장고에 저장", type="primary", use_container_width=True):
             saved = 0
             for e in edited:
-                if e["include"]:
-                    add_item(e["item_name"], e["category"], e["purchase_date"], e["expiration_date"])
+                if e["include"] and e["item_name"].strip():
+                    add_item(e["item_name"].strip(), e["category"], e["purchase_date"], e["expiration_date"])
                     saved += 1
             st.session_state.pop("scanned", None)
-            st.success(f"{saved}개 품목을 냉장고에 저장했어요! '내 냉장고' 탭에서 확인하세요. 🎉")
+            st.success(f"{saved}개 품목을 저장했어요! '내 냉장고' 탭에서 확인하세요. 🎉")
             st.rerun()
 
-        if cbtn[1].button("↩️ 결과 지우기", use_container_width=True):
+        if cbtn[1].button("↩️ 목록 지우기", use_container_width=True):
             st.session_state.pop("scanned", None)
             st.rerun()
